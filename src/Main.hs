@@ -24,6 +24,7 @@ import System.IO
 -- Text
 import Data.Char
 import Text.Read (readMaybe)
+import Text.Printf
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import Data.Text (Text)
@@ -35,8 +36,6 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.Vector as V
 import Data.Vector (Vector)
 import qualified Data.HashSet as HS
--- Tracing
-import Debug.Trace
 -- Hashable
 import Data.Hashable
 
@@ -163,38 +162,43 @@ buildFile = do
   -- A reverse index for users (because numerical ids are better than guids
   -- that are used in the original file):
   usersIndex <- HM.fromList . indexConsecutive . map (^. _1) <$> getListens
+  -- Songs index using artist ids instead of artists:
+  let songsIndex' = songsIndex & traversed . _1 %~ (artistsIndex HM.!)
   
   -- Listens:
   listens <- getListens
 
   -- File writing begins.
-  TL.writeFile "listens.txt" . TL.unlines . map TL.fromStrict $
-    -- amount of artists
-    (let len = length artists
-     in  trace ("artists: " ++ show len) [tshow len]) ++
-    -- artists
-    artists ++
-    trace "done writing artists" [] ++
-    -- amount of songs
-    (let len = HM.size songsIndex
-     in  trace ("songs: " ++ show len) [tshow len]) ++
-    -- (song, artist, title) tuples
-    flip map (HM.toList songsIndex) (\(song, (artist, title)) ->
-      T.intercalate "\t" [
-        song,
-        tshow (artistsIndex HM.! artist),
-        title ]) ++
-    trace "done writing songs" [] ++
-    -- (user, song, artist, plays) tuples
-    (let len = HM.size usersIndex
-     in  trace ("users: " ++ show len) []) ++
-    flip map listens (\(user, song, plays) ->
-      T.intercalate "\t" [
-        tshow (usersIndex HM.! user),
-        song,
-        tshow (fst (songsIndex HM.! song)),
-        tshow plays ]) ++
-    trace "done writing listens" []
+  T.writeFile "listens.txt" ""
+  let write = TL.writeFile "listens.txt" . TL.unlines . map TL.fromStrict
+  -- Amount of artists:
+  let artistCount = length artists
+  write [tshow artistCount]
+  printf "artists: %d\n" artistCount
+  -- Artists:
+  write artists
+  printf "done writing artists\n"
+  -- Amount of songs:
+  let songCount = HM.size songsIndex'
+  write [tshow songCount]
+  printf "songs: %d\n" songCount
+  -- (song, artist, title) tuples:
+  write $ flip map (HM.toList songsIndex') $ \(song, (artist, title)) ->
+    T.intercalate "\t" [
+      song,
+      tshow artist,
+      title ]
+  printf "done writing songs\n"
+  -- (user, song, artist, plays) tuples:
+  let userCount = HM.size usersIndex
+  printf "users: %d\n" userCount
+  write $ flip map listens $ \(user, song, plays) ->
+    T.intercalate "\t" [
+      tshow (usersIndex HM.! user),
+      song,
+      tshow (fst (songsIndex' HM.! song)),
+      tshow plays ]
+  printf "done writing listens\n"
 
 countPlays :: Artist -> IO ()
 countPlays cmdArtist = do
