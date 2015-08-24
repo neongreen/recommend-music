@@ -222,4 +222,4 @@ hashNub :: (Eq a, Hashable a) => [a] -> [a]
 hashNub = HS.toList . HS.fromList
 
 strictLines :: TL.Text -> [Text]
-strictLines = map TL.toStrict . TL.lines
+strictLines = map (T.copy . TL.toStrict) . TL.lines
