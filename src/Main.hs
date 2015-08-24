@@ -149,7 +149,6 @@ buildFile = do
       parseListen s = do
         [user, song, playsText] <- return (T.splitOn "\t" s)
         plays <- readMaybe (T.unpack playsText)
-        (artist, title) <- HM.lookup song songsIndex
         return (user, song, plays)
   -- The listens file is big and we don't want to store it in memory, so
   -- we're going to use getListens whenever we actually need listens.
