@@ -154,6 +154,20 @@ getArtistId db artist = do
     []       -> error $ printf "no artists called “%s”" (T.unpack artist)
     _        -> error $ printf "several artists called “%s”" (T.unpack artist)
 
+addArtist :: SQL.Connection -> Artist -> IO ()
+addArtist db artist = SQL.execute db
+  "INSERT INTO artists (name) VALUES (?)"
+  (Only artist)
+
+addSong :: SQL.Connection -> SongTextId -> Artist -> Title -> IO SongId
+addSong db song artist title = do
+  SQL.execute db
+    "INSERT INTO songs (text_id, artist, title) \
+    \VALUES (?, (SELECT id FROM artists WHERE name = ?), ?)"
+    (song, artist, title)
+  songId <- SQL.lastInsertRowId db
+  return songId
+
 {- |
 Build a data file out of unique_tracks.txt and train_triplets.txt.
 
@@ -180,12 +194,13 @@ buildMusicDb = do
     SQL.execute_ db "PRAGMA journal_mode = MEMORY"
     -- Artists:
     SQL.withTransaction db $
-      mapM_ (writeArtist db) artists
+      mapM_ (addArtist db) artists
     putStrLn "done writing artists"
     -- Songs:
     songIds <- fmap HM.fromList $ SQL.withTransaction db $
-      for (HM.toList songsIndex) $ \(song, (artist, title)) ->
-        writeSong db song artist title
+      for (HM.toList songsIndex) $ \(song, (artist, title)) -> do
+        songId <- addSong db song artist title
+        return (song, songId)
     putStrLn "done writing songs"
     -- Listens:
     let listens' = listens & each . _2 %~ (songIds HM.!)
@@ -193,16 +208,6 @@ buildMusicDb = do
       foldM_ (writeListen db) ("fake user identificator", 0::Int) listens'
     putStrLn "done writing listens"
   where
-    writeArtist db artist = SQL.execute db
-      "INSERT INTO artists (name) VALUES (?)"
-      (Only artist)
-    writeSong db song artist title = do
-      SQL.execute db
-        "INSERT INTO songs (text_id, artist, title) \
-        \VALUES (?, (SELECT id FROM artists WHERE name = ?), ?)"
-        (song, artist, title)
-      songId <- SQL.lastInsertRowId db
-      return (song, songId)
     writeListen db (prevUser, prevUserId) (user, songId, plays) = do
       let userId | user == prevUser = prevUserId
                  | otherwise        = prevUserId + 1
