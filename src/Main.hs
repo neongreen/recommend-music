@@ -12,12 +12,11 @@ import Control.Monad
 import Data.Foldable
 import Data.Traversable
 import Data.Maybe
-import Control.Monad.State
 import Data.Int
 -- Lenses
 import Lens.Micro
 -- Lists
-import Data.List (uncons)
+import GHC.Exts (sortWith)
 -- Command-line options
 import Options.Applicative
 -- IO
@@ -42,7 +41,13 @@ import Database.SQLite.Simple (Only(..))
 
 data Command
   = Build
-  | Count { cmdArtist :: Artist }
+  | Count {
+      cmdArtist         :: Artist }
+  | Best {
+      cmdArtist         :: Artist,
+      cmdLikedSongPlays :: Int,
+      cmdLikedSongsMin  :: Int,
+      cmdTopSongs       :: Int }
 
 mkcmd :: String -> String -> Parser a -> Mod CommandFields a
 mkcmd cmd desc parser = command cmd $ info (helper <*> parser) (progDesc desc)
@@ -54,10 +59,19 @@ cmdargs = info
   where
     commands = [
       mkcmd "build" buildDesc $ pure Build,
-      mkcmd "count" countDesc $ Count <$> artistP ]
+      mkcmd "count" countDesc $ Count
+        <$> artistP,
+      mkcmd "best"  bestDesc $ Best
+        <$> artistP
+        <*> intP "plays"       8 "how many plays should a liked song have"
+        <*> intP "liked-songs" 5 "how many liked songs should a fan have"
+        <*> intP "top-songs"   3 "how many liked songs of a fan to consider" ]
     buildDesc = "build a data file out of MSD datasets"
     countDesc = "count total plays of all songs by an artist"
+    bestDesc  = "show songs by an artist which have the most fans"
     artistP = T.pack <$> strArgument (metavar "ARTIST")
+    intP name def desc = option auto $
+      long name <> value def <> help desc <> metavar "INT"
 
 type UserId     = Int64
 type SongTextId = Text
@@ -70,8 +84,10 @@ main :: IO ()
 main = do
   cmd <- execParser cmdargs
   case cmd of
-    Build -> buildMusicDb
+    Build     -> buildMusicDb
     Count{..} -> countPlays cmdArtist
+    Best{..}  -> recommendBest cmdArtist
+                   cmdLikedSongPlays cmdLikedSongsMin cmdTopSongs
 
 -- Read track data (from unique_tracks.txt).
 readTracks :: TL.Text -> HashMap SongTextId (Artist, Title)
@@ -127,6 +143,16 @@ withMusicDb act = do
   result <- act db
   SQL.close db
   return result
+
+getArtistId :: SQL.Connection -> Artist -> IO ArtistId
+getArtistId db artist = do
+  mbArtistId <- SQL.query db
+    "SELECT id FROM artists WHERE name=?"
+    (Only artist)
+  case mbArtistId of
+    [Only x] -> return x
+    []       -> error $ printf "no artists called “%s”" (T.unpack artist)
+    _        -> error $ printf "several artists called “%s”" (T.unpack artist)
 
 {- |
 Build a data file out of unique_tracks.txt and train_triplets.txt.
@@ -187,14 +213,8 @@ buildMusicDb = do
       return (user, userId)
 
 countPlays :: Artist -> IO ()
-countPlays cmdArtist = withMusicDb $ \db -> do
-  mbArtist <- SQL.query db
-    "SELECT id FROM artists WHERE name = ?"
-    (Only cmdArtist)
-  artist <- case mbArtist of
-    [Only x] -> return (x :: ArtistId)
-    []       -> error "no artists with this name"
-    _        -> error "several artists with this name"
+countPlays artistName = withMusicDb $ \db -> do
+  artist <- getArtistId db artistName
   [Only res] <- SQL.query db
     "SELECT sum(listens.plays) \
     \FROM listens \
@@ -203,6 +223,59 @@ countPlays cmdArtist = withMusicDb $ \db -> do
     (Only artist)
   print (res :: Int)
 
+findFans :: SQL.Connection -> ArtistId -> Int -> Int -> IO [UserId]
+findFans db artist likedSongPlays likedSongsMin =
+  map fromOnly <$> SQL.query db
+    "SELECT listens.user \
+    \FROM listens \
+    \INNER JOIN songs ON listens.song = songs.id \
+    \WHERE listens.plays >= ? AND songs.artist=? \
+    \GROUP BY listens.user \
+    \HAVING count(listens.song) >= ?"
+    (likedSongPlays, artist, likedSongsMin)
+
+findSongs :: SQL.Connection -> ArtistId -> IO [SongId]
+findSongs db artist =
+  map fromOnly <$> SQL.query db
+    "SELECT id FROM songs WHERE artist=?"
+    (Only artist)
+
+getSongTitle :: SQL.Connection -> SongId -> IO Title
+getSongTitle db song =
+  head . map fromOnly <$> SQL.query db
+    "SELECT title FROM songs WHERE id=?"
+    (Only song)
+
+findFavorites :: SQL.Connection -> ArtistId -> UserId -> Int -> IO [SongId]
+findFavorites db artist user limit =
+  map fromOnly <$> SQL.query db
+    "SELECT listens.song \
+    \FROM listens \
+    \INNER JOIN songs ON listens.song = songs.id \
+    \WHERE listens.user=? AND songs.artist=? \
+    \ORDER BY listens.plays DESC \
+    \LIMIT ?"
+    (user, artist, limit)
+
+recommendBest :: Artist -> Int -> Int -> Int -> IO ()
+recommendBest artistName likedSongPlays likedSongsMin topSongs =
+  withMusicDb $ \db -> do
+  artist <- getArtistId db artistName
+  -- Find fans (i.e. people who like X or more songs, where “like” means
+  -- “listened Y times or more”).
+  artistFans <- findFans db artist likedSongPlays likedSongsMin
+  -- For each fan, find nir top Z favorite songs.
+  favoriteLists <- for artistFans $ \fan ->
+    findFavorites db artist fan topSongs
+  -- Also find all songs of the artist.
+  songs <- findSongs db artist
+  -- For each song, say how many people like it.
+  let countFans song = length (filter (song `elem`) favoriteLists)
+      songs' = reverse . sortWith snd $
+        [(song, fans) | song <- songs, let fans = countFans song, fans /= 0]
+  for_ songs' $ \(song, fans) -> do
+    title <- T.unpack <$> getSongTitle db song
+    printf "%4d – %s\n" fans title
 
 -- Utils
 
