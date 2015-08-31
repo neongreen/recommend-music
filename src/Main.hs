@@ -32,6 +32,7 @@ import qualified Data.Text.Lazy.IO as TL
 import qualified Data.HashMap.Strict as HM
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashSet as HS
+import Data.HashSet (HashSet)
 -- Hashable
 import Data.Hashable
 -- SQL
@@ -73,11 +74,12 @@ cmdargs = info
     intP name def desc = option auto $
       long name <> value def <> help desc <> metavar "INT"
 
+type UserTextId = Text
 type UserId     = Int64
 type SongTextId = Text
 type SongId     = Int64
-type ArtistId   = Int64
 type Artist     = Text
+type ArtistId   = Int64
 type Title      = Text
 
 main :: IO ()
@@ -98,13 +100,22 @@ readTracks = HM.fromList . mapMaybe parseTrack . strictLines
       return (song, (artist, title))
 
 -- Read listens data (from train_triplets.txt).
-readListens :: TL.Text -> [(Text, SongTextId, Int)]
+readListens :: TL.Text -> [(UserTextId, SongTextId, Int)]
 readListens = mapMaybe parseListen . strictLines
   where
     parseListen s = do
       [user, song, playsText] <- return (T.splitOn "\t" s)
       plays <- readMaybe (T.unpack playsText)
       return (user, song, plays)
+
+-- Read untrusted song ids (from sid_mismatches.txt).
+readUntrustedSongs :: TL.Text -> HashSet SongTextId
+readUntrustedSongs = HS.fromList . mapMaybe parseUntrusted . strictLines
+  where
+    parseUntrusted s = do
+      (_:x:_) <- return (T.words s)
+      guard (T.head x == '<')
+      return (T.tail x)
 
 initMusicDb :: SQL.Connection -> IO ()
 initMusicDb db = do
@@ -175,14 +186,22 @@ Links to the dataset:
   * playcounts: <http://labrosa.ee.columbia.edu/millionsong/tasteprofile>
 
   * song titles: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/AdditionalFiles/unique_tracks.txt>
+
+  * untrusted songs: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/tasteprofile/sid_mismatches.txt>
 -}
 buildMusicDb :: IO ()
 buildMusicDb = do
-  -- Read track data.
-  songs <- readTracks <$> TL.readFile "unique_tracks.txt"
+  -- Read untrusted songs.
+  untrusted <- readUntrustedSongs <$> TL.readFile "sid_mismatches.txt"
+  let isTrusted x = not (x `HS.member` untrusted)
+  -- Read track data and filter out untrusted songs.
+  songs <- HM.filterWithKey (\k _ -> isTrusted k) .
+             readTracks <$> TL.readFile "unique_tracks.txt"
+  -- Gather a list of all artists.
   let artists = hashNub . map fst . HM.elems $ songs
-  -- Read listens data.
-  listens <- readListens <$> TL.readFile "train_triplets.txt"
+  -- Read listens data and filter out listens of untrusted songs.
+  listens <- filter (\(_, song, _) -> isTrusted song) .
+               readListens <$> TL.readFile "train_triplets.txt"
   -- Write stuff to the database.
   exists <- doesFileExist "music.db"
   when exists $ removeFile "music.db"
