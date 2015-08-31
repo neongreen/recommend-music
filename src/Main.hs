@@ -13,10 +13,12 @@ import Data.Foldable
 import Data.Traversable
 import Data.Maybe
 import Data.Int
+import Data.Function
 -- Lenses
 import Lens.Micro
 -- Lists
 import GHC.Exts (sortWith)
+import Data.List (groupBy)
 -- Command-line options
 import Options.Applicative
 -- IO
@@ -74,8 +76,7 @@ cmdargs = info
     intP name def desc = option auto $
       long name <> value def <> help desc <> metavar "INT"
 
-type UserTextId = Text
-type UserId     = Int64
+type UserId     = Int
 type SongTextId = Text
 type SongId     = Int64
 type Artist     = Text
@@ -99,14 +100,16 @@ readTracks = HM.fromList . mapMaybe parseTrack . strictLines
       [_,song, artist, title] <- return (T.splitOn "<SEP>" s)
       return (song, (artist, title))
 
--- Read listens data (from train_triplets.txt).
-readListens :: TL.Text -> [(UserTextId, SongTextId, Int)]
-readListens = mapMaybe parseListen . strictLines
+-- Read listens data (from train_triplets.txt) and groups listens by user
+-- (this takes advantage of the fact that input file is already sorted).
+readListens :: TL.Text -> [[(SongTextId, Int)]]
+readListens = groupByUser . mapMaybe parseListen . strictLines
   where
+    groupByUser = map (map snd) . groupBy ((==) `on` fst)
     parseListen s = do
       [user, song, playsText] <- return (T.splitOn "\t" s)
       plays <- readMaybe (T.unpack playsText)
-      return (user, song, plays)
+      return (user, (song, plays))
 
 -- Read untrusted song ids (from sid_mismatches.txt).
 readUntrustedSongs :: TL.Text -> HashSet SongTextId
@@ -178,6 +181,13 @@ addSong db artist title = do
   songId <- SQL.lastInsertRowId db
   return songId
 
+addListens :: SQL.Connection -> UserId -> [(SongId, Int)] -> IO ()
+addListens db userId ls = for_ ls $ \(songId, plays) ->
+  SQL.execute db
+    "INSERT INTO listens (user, song, plays) \
+    \VALUES (?, ?, ?)"
+    (userId, songId, plays)
+
 {- |
 Build a data file out of unique_tracks.txt and train_triplets.txt.
 
@@ -200,7 +210,7 @@ buildMusicDb = do
   -- Gather a list of all artists.
   let artists = hashNub . map fst . HM.elems $ songs
   -- Read listens data and filter out listens of untrusted songs.
-  listens <- filter (\(_, song, _) -> isTrusted song) .
+  listens <- map (filter (\(song, _) -> isTrusted song)) .
                readListens <$> TL.readFile "train_triplets.txt"
   -- Write stuff to the database.
   exists <- doesFileExist "music.db"
@@ -221,19 +231,11 @@ buildMusicDb = do
         return (song, songId)
     putStrLn "done writing songs"
     -- Listens:
-    let listens' = listens & each . _2 %~ (songIds HM.!)
+    let listens' :: [[(SongId, Int)]]
+        listens' = listens & each.each._1 %~ (songIds HM.!)
     SQL.withTransaction db $
-      foldM_ (writeListen db) ("fake user identificator", 0::Int) listens'
+      zipWithM_ (addListens db) [0..] listens'
     putStrLn "done writing listens"
-  where
-    writeListen db (prevUser, prevUserId) (user, songId, plays) = do
-      let userId | user == prevUser = prevUserId
-                 | otherwise        = prevUserId + 1
-      SQL.execute db
-        "INSERT INTO listens (user, song, plays) \
-        \VALUES (?, ?, ?)"
-        (userId, songId, plays)
-      return (user, userId)
 
 countPlays :: Artist -> IO ()
 countPlays artistName = withMusicDb $ \db -> do
