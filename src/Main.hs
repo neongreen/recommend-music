@@ -119,7 +119,6 @@ initMusicDb db = do
   SQL.execute_ db
     "CREATE TABLE songs (\
     \id INTEGER PRIMARY KEY,\
-    \text_id TEXT NOT NULL,\
     \artist INTEGER NOT NULL,\
     \title TEXT NOT NULL,\
     \FOREIGN KEY(artist) REFERENCES artists(id))"
@@ -159,12 +158,12 @@ addArtist db artist = SQL.execute db
   "INSERT INTO artists (name) VALUES (?)"
   (Only artist)
 
-addSong :: SQL.Connection -> SongTextId -> Artist -> Title -> IO SongId
-addSong db song artist title = do
+addSong :: SQL.Connection -> Artist -> Title -> IO SongId
+addSong db artist title = do
   SQL.execute db
-    "INSERT INTO songs (text_id, artist, title) \
-    \VALUES (?, (SELECT id FROM artists WHERE name = ?), ?)"
-    (song, artist, title)
+    "INSERT INTO songs (artist, title) \
+    \VALUES ((SELECT id FROM artists WHERE name=?), ?)"
+    (artist, title)
   songId <- SQL.lastInsertRowId db
   return songId
 
@@ -180,8 +179,8 @@ Links to the dataset:
 buildMusicDb :: IO ()
 buildMusicDb = do
   -- Read track data.
-  songsIndex <- readTracks <$> TL.readFile "unique_tracks.txt"
-  let artists = hashNub . map fst . HM.elems $ songsIndex
+  songs <- readTracks <$> TL.readFile "unique_tracks.txt"
+  let artists = hashNub . map fst . HM.elems $ songs
   -- Read listens data.
   listens <- readListens <$> TL.readFile "train_triplets.txt"
   -- Write stuff to the database.
@@ -198,8 +197,8 @@ buildMusicDb = do
     putStrLn "done writing artists"
     -- Songs:
     songIds <- fmap HM.fromList $ SQL.withTransaction db $
-      for (HM.toList songsIndex) $ \(song, (artist, title)) -> do
-        songId <- addSong db song artist title
+      for (HM.toList songs) $ \(song, (artist, title)) -> do
+        songId <- addSong db artist title
         return (song, songId)
     putStrLn "done writing songs"
     -- Listens:
