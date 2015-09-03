@@ -1,10 +1,12 @@
 {-# LANGUAGE
 RecordWildCards,
-OverloadedStrings
+OverloadedStrings,
+TupleSections,
+ScopedTypeVariables
   #-}
 
 
-module Main where
+module Main (main) where
 
 
 -- General
@@ -12,8 +14,10 @@ import Control.Monad
 import Data.Foldable
 import Data.Traversable
 import Data.Maybe
-import Data.Int
 import Data.Function
+import Control.Arrow
+-- Numbers
+import Data.Int
 -- Lenses
 import Lens.Micro
 -- Lists
@@ -35,11 +39,14 @@ import qualified Data.HashMap.Strict as HM
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashSet as HS
 import Data.HashSet (HashSet)
--- Hashable
-import Data.Hashable
+-- Hashing
+import Data.Hashable (Hashable)
+import Data.Hashabler hiding (Hashable)
 -- SQL
 import qualified Database.SQLite.Simple as SQL
 import Database.SQLite.Simple (Only(..))
+-- deepseq
+import Control.DeepSeq
 
 
 data Command
@@ -76,11 +83,15 @@ cmdargs = info
     intP name def desc = option auto $
       long name <> value def <> help desc <> metavar "INT"
 
-type UserId     = Int
+type UserTextId = Text
+type UserId     = Int64
+
 type SongTextId = Text
 type SongId     = Int64
+
 type Artist     = Text
 type ArtistId   = Int64
+
 type Title      = Text
 
 main :: IO ()
@@ -92,33 +103,83 @@ main = do
     Best{..}  -> recommendBest cmdArtist
                    cmdLikedSongPlays cmdLikedSongsMin cmdTopSongs
 
+{-
+The Echo Nest / MSD music dataset:
+
+  * playcounts: <http://labrosa.ee.columbia.edu/millionsong/tasteprofile>
+
+  * song titles: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/AdditionalFiles/unique_tracks.txt>
+
+  * untrusted songs: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/tasteprofile/sid_mismatches.txt>
+-}
+
 -- Read track data (from unique_tracks.txt).
-readTracks :: TL.Text -> HashMap SongTextId (Artist, Title)
-readTracks = HM.fromList . mapMaybe parseTrack . strictLines
+msdReadTracks :: TL.Text -> [((Artist, Title), SongTextId)]
+msdReadTracks = mapMaybe parseTrack . strictLines
   where
     parseTrack s = do
-      [_,song, artist, title] <- return (T.splitOn "<SEP>" s)
-      return (song, (artist, title))
+      [_,song, artist, title] <- return (parseSsvRow "<SEP>" s)
+      return ((artist, title), song)
 
--- Read listens data (from train_triplets.txt) and groups listens by user
--- (this takes advantage of the fact that input file is already sorted).
-readListens :: TL.Text -> [[(SongTextId, Int)]]
-readListens = groupByUser . mapMaybe parseListen . strictLines
+-- Read listens data (from train_triplets.txt)
+msdReadListens :: TL.Text -> [(UserId, (SongTextId, Int))]
+msdReadListens = over (each._1) hashUser .
+                 mapMaybe parseListen . strictLines
   where
-    groupByUser = map (map snd) . groupBy ((==) `on` fst)
+    parseListen :: Text -> Maybe (UserTextId, (SongTextId, Int))
     parseListen s = do
-      [user, song, playsText] <- return (T.splitOn "\t" s)
+      [user, song, playsText] <- return (parseSsvRow "\t" s)
       plays <- readMaybe (T.unpack playsText)
       return (user, (song, plays))
+    -- Hash a user id.
+    hashUser u = hashToRowId (hashFNV64 ("MSD" :: Text, u))
 
 -- Read untrusted song ids (from sid_mismatches.txt).
-readUntrustedSongs :: TL.Text -> HashSet SongTextId
-readUntrustedSongs = HS.fromList . mapMaybe parseUntrusted . strictLines
+msdReadUntrustedSongs :: TL.Text -> HashSet SongTextId
+msdReadUntrustedSongs = HS.fromList . mapMaybe parseUntrusted . strictLines
   where
     parseUntrusted s = do
       (_:x:_) <- return (T.words s)
       guard (T.head x == '<')
       return (T.tail x)
+
+{-
+The #nowplaying dataset: http://dbis-nowplaying.uibk.ac.at/
+-}
+
+-- Read track data (from nowplaying.csv) (takes advantage of the fact that
+-- input file is sorted by track).
+npReadTracks :: TL.Text -> [((Artist, Title), SongTextId)]
+npReadTracks = removeDuplicates . mapMaybe parseTrack . strictLines
+  where
+    removeDuplicates = map head . groupBy (equating snd)
+    parseTrack s = do
+      [_,_,_,title,artist,songId] <- return (parseSsvRow "," s)
+      return ((artist, title), songId)
+
+-- todo: use “data NpRecord” instead of parsing into a list of values
+
+-- according to birthday paradox, the probability of collisions among several million entries should be pretty small
+
+-- Read listens data (from nowplaying.csv).
+npReadListens :: TL.Text -> [(SongTextId, [(UserId, Int)])]
+npReadListens = over (each._2) countUsers . groupByTrack .
+                over (each._2) hashUser .
+                mapMaybe parseListen . strictLines
+  where
+    -- Parse a single listen from the file.
+    parseListen :: Text -> Maybe (SongTextId, UserTextId)
+    parseListen s = do
+      [_,user,_,_,_,songId] <- return (parseSsvRow "," s)
+      return (songId, user)
+    -- Group listens by track (easy, since the input file is sorted by track).
+    groupByTrack :: [(SongTextId, UserId)] -> [(SongTextId, [UserId])]
+    groupByTrack = map (fst.head &&& map snd) . groupBy (equating fst)
+    -- Count users who all listened to the same song.
+    countUsers :: [UserId] -> [(UserId, Int)]
+    countUsers = HM.toList . countByHashMap
+    -- Hash a user id.
+    hashUser u = hashToRowId (hashFNV64 ("#np" :: Text, u))
 
 initMusicDb :: SQL.Connection -> IO ()
 initMusicDb db = do
@@ -157,6 +218,12 @@ withMusicDb act = do
   SQL.close db
   return result
 
+withNewMusicDb :: (SQL.Connection -> IO a) -> IO a
+withNewMusicDb act = do
+  exists <- doesFileExist "music.db"
+  when exists $ removeFile "music.db"
+  withMusicDb act
+
 getArtistId :: SQL.Connection -> Artist -> IO ArtistId
 getArtistId db artist = do
   mbArtistId <- SQL.query db
@@ -178,64 +245,77 @@ addSong db artist title = do
     "INSERT INTO songs (artist, title) \
     \VALUES ((SELECT id FROM artists WHERE name=?), ?)"
     (artist, title)
-  songId <- SQL.lastInsertRowId db
-  return songId
+  SQL.lastInsertRowId db
 
-addListens :: SQL.Connection -> UserId -> [(SongId, Int)] -> IO ()
-addListens db userId ls = for_ ls $ \(songId, plays) ->
-  SQL.execute db
-    "INSERT INTO listens (user, song, plays) \
-    \VALUES (?, ?, ?)"
-    (userId, songId, plays)
+addListens :: SQL.Connection -> [(UserId, (SongId, Int))] -> IO ()
+addListens db ls = do
+  -- It's possible that this combination of (user, song) already exists, and
+  -- in this case we must add playcounts together.
+  let query :: SQL.Query
+      query = "INSERT OR REPLACE INTO listens (user, song, plays) \
+              \VALUES (?, ?, \
+              \        IFNULL((SELECT plays+? FROM listens \
+              \                WHERE user=? AND song=?), ?))"
+  SQL.withStatement db query $ \statement ->
+    for_ ls $ \(user, (song, plays)) -> do
+      SQL.bind statement (user, song, plays, user, song, plays)
+      -- The statement we're executing is an INSERT and I don't really know
+      -- what it returns – I don't care what it returns – but I used this
+      -- type just in case it returns the inserted row.
+      SQL.nextRow statement :: IO (Maybe (UserId, SongId, Int))
+      SQL.reset statement
 
-{- |
-Build a data file out of unique_tracks.txt and train_triplets.txt.
-
-Links to the dataset:
-
-  * playcounts: <http://labrosa.ee.columbia.edu/millionsong/tasteprofile>
-
-  * song titles: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/AdditionalFiles/unique_tracks.txt>
-
-  * untrusted songs: <http://labrosa.ee.columbia.edu/millionsong/sites/default/files/tasteprofile/sid_mismatches.txt>
--}
+findDuplicateSongs ::
+  [((Artist, Title), SongTextId)] ->
+  HashMap (Artist, Title) [SongTextId]
+findDuplicateSongs = HM.fromListWith (++) . over (each._2) (:[])
+     
 buildMusicDb :: IO ()
-buildMusicDb = do
-  -- Read untrusted songs.
-  untrusted <- readUntrustedSongs <$> TL.readFile "sid_mismatches.txt"
+buildMusicDb = withNewMusicDb $ \db -> do
+  -- Trade some safety for speed.
+  SQL.execute_ db "PRAGMA synchronous = OFF"
+  SQL.execute_ db "PRAGMA journal_mode = MEMORY"
+  -- Initialise the database.
+  initMusicDb db
+  -- Read untrusted songs for the MSD dataset.
+  untrusted <- msdReadUntrustedSongs <$> TL.readFile "sid_mismatches.txt"
   let isTrusted x = not (x `HS.member` untrusted)
-  -- Read track data and filter out untrusted songs.
-  songs <- HM.filterWithKey (\k _ -> isTrusted k) .
-             readTracks <$> TL.readFile "unique_tracks.txt"
-  -- Gather a list of all artists.
-  let artists = hashNub . map fst . HM.elems $ songs
-  -- Read listens data and filter out listens of untrusted songs.
-  listens <- map (filter (\(song, _) -> isTrusted song)) .
-               readListens <$> TL.readFile "train_triplets.txt"
-  -- Write stuff to the database.
-  exists <- doesFileExist "music.db"
-  when exists $ removeFile "music.db"
-  withMusicDb $ \db -> do
-    initMusicDb db
-    -- Trade some safety for speed.
-    SQL.execute_ db "PRAGMA synchronous = OFF"
-    SQL.execute_ db "PRAGMA journal_mode = MEMORY"
-    -- Artists:
-    SQL.withTransaction db $
-      mapM_ (addArtist db) artists
-    putStrLn "done writing artists"
-    -- Songs:
-    songIds <- fmap HM.fromList $ SQL.withTransaction db $
-      for (HM.toList songs) $ \(song, (artist, title)) -> do
-        songId <- addSong db artist title
-        return (song, songId)
-    putStrLn "done writing songs"
-    -- Listens:
-    let listens' :: [[(SongId, Int)]]
-        listens' = listens & each.each._1 %~ (songIds HM.!)
-    SQL.withTransaction db $
-      zipWithM_ (addListens db) [0..] listens'
-    putStrLn "done writing listens"
+  -- Read songs data.
+  msdSongs <- filter (isTrusted . snd) .
+                msdReadTracks <$> TL.readFile "unique_tracks.txt"
+  npSongs <- npReadTracks <$> TL.readFile "nowplaying.csv"
+  let songs :: HashMap (Artist, Title) [SongTextId]
+      songs = findDuplicateSongs (msdSongs ++ npSongs)
+  -- Write artists into the database.
+  let artists = hashNub . map fst . HM.keys $ songs
+  SQL.withTransaction db $
+    mapM_ (addArtist db) artists
+  putStrLn "done writing artists"
+  -- Write songs into the database.
+  songIds <- SQL.withTransaction db $ do
+    pairs <- for (HM.toList songs) $ \((artist, title), textIds) -> do
+      songId <- addSong db artist title
+      return (map (,songId) textIds)
+    return (HM.fromList (concat pairs))
+  putStrLn "done writing songs"
+  -- Read MSD listens and write them into the database.
+  msdListens <- filter (isTrusted . fst . snd) .
+                msdReadListens <$> TL.readFile "train_triplets.txt"
+  let msdListens' = over (each._2._1) (songIds HM.!) msdListens
+  SQL.withTransaction db $
+    addListens db msdListens'
+  putStrLn "done writing MSD listens"
+  -- Read #nowplaying listens and write them into the database.
+  npListens <- npReadListens <$> TL.readFile "nowplaying.csv"
+  let expandNp :: (SongTextId, [(UserId, Int)]) -> [(UserId, (SongId, Int))]
+      expandNp (songId, us) = do
+        let song = songIds HM.! songId
+        (user, plays) <- us
+        return (user, (song, plays))
+  let npListens' = concatMap expandNp npListens
+  SQL.withTransaction db $
+    addListens db npListens'
+  putStrLn "done writing #nowplaying listens"
 
 countPlays :: Artist -> IO ()
 countPlays artistName = withMusicDb $ \db -> do
@@ -304,14 +384,36 @@ recommendBest artistName likedSongPlays likedSongsMin topSongs =
 
 -- Utils
 
-tshow :: Show a => a -> Text
-tshow = T.pack . show
-
-tread :: Read a => Text -> a
-tread = read . T.unpack
-
 hashNub :: (Eq a, Hashable a) => [a] -> [a]
 hashNub = HS.toList . HS.fromList
 
 strictLines :: TL.Text -> [Text]
 strictLines = map (T.copy . TL.toStrict) . TL.lines
+
+-- | Parse a row of values separated by some separator. Values can be quoted
+-- or unquoted; if quoted, standard CSV rules apply (separators can appear in
+-- quotes and then they don't count as separators, «""» counts as «"»).
+parseSsvRow :: Text -> Text -> [Text]
+parseSsvRow sep s = force $ map T.copy $ go (T.splitOn sep s)
+  where
+    go [] = []
+    go (x:xs) = case T.uncons x of
+      Just ('"', rest) -> goQuoted [] (rest:xs)
+      _other           -> x : go xs
+    reconstruct = T.intercalate sep . reverse
+    goQuoted xs [] = [reconstruct xs]
+    goQuoted xs (p:ps)
+      | even trailingQuotes = goQuoted (p':xs) ps
+      | otherwise           = reconstruct (T.init p' : xs) : go ps
+      where
+        trailingQuotes = T.length p - T.length (T.dropWhileEnd (== '"') p)
+        p' = T.replace "\"\"" "\"" p
+
+equating :: Eq b => (a -> b) -> (a -> a -> Bool)
+equating f = (==) `on` f
+
+countByHashMap :: (Eq a, Hashable a) => [a] -> HashMap a Int
+countByHashMap = HM.fromListWith (+) . map (,1)
+
+hashToRowId :: Hash64 -> Int64
+hashToRowId = fromIntegral . hashWord64

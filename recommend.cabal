@@ -18,8 +18,10 @@ executable recommend
   -- other-extensions:    
   build-depends:       base >= 4.8 && < 4.9
                      , binary >= 0.7
+                     , deepseq >= 1.2
                      , directory
                      , hashable
+                     , hashabler == 1.*
                      , microlens == 0.3.*
                      , mtl == 2.*
                      , optparse-applicative == 0.11.*
