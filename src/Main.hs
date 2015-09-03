@@ -16,13 +16,13 @@ import Data.Traversable
 import Data.Maybe
 import Data.Function
 import Control.Arrow
+import Data.Ord
 -- Numbers
 import Data.Int
 -- Lenses
 import Lens.Micro
 -- Lists
-import GHC.Exts (sortWith)
-import Data.List (groupBy)
+import Data.List (groupBy, sortOn)
 -- Command-line options
 import Options.Applicative
 -- IO
@@ -58,6 +58,10 @@ data Command
       cmdLikedSongPlays :: Int,
       cmdLikedSongsMin  :: Int,
       cmdTopSongs       :: Int }
+  | Diverse {
+      cmdArtist         :: Artist,
+      cmdLikedSongPlays :: Int,
+      cmdLikedSongsMin  :: Int }
 
 mkcmd :: String -> String -> Parser a -> Mod CommandFields a
 mkcmd cmd desc parser = command cmd $ info (helper <*> parser) (progDesc desc)
@@ -71,14 +75,19 @@ cmdargs = info
       mkcmd "build" buildDesc $ pure Build,
       mkcmd "count" countDesc $ Count
         <$> artistP,
-      mkcmd "best"  bestDesc $ Best
+      mkcmd "best" bestDesc $ Best
         <$> artistP
         <*> intP "plays"       8 "how many plays should a liked song have"
         <*> intP "liked-songs" 5 "how many liked songs should a fan have"
-        <*> intP "top-songs"   3 "how many liked songs of a fan to consider" ]
-    buildDesc = "build a data file out of MSD datasets"
-    countDesc = "count total plays of all songs by an artist"
-    bestDesc  = "show songs by an artist which have the most fans"
+        <*> intP "top-songs"   3 "how many liked songs of a fan to consider",
+      mkcmd "diverse" diverseDesc $ Diverse
+        <$> artistP
+        <*> intP "plays"       8 "how many plays should a liked song have"
+        <*> intP "liked-songs" 5 "how many liked songs should a fan have" ]
+    buildDesc   = "build a data file out of MSD datasets"
+    countDesc   = "count total plays of all songs by an artist"
+    bestDesc    = "show songs by an artist which have the most fans"
+    diverseDesc = "find a diverse set of good songs by an artist"
     artistP = T.pack <$> strArgument (metavar "ARTIST")
     intP name def desc = option auto $
       long name <> value def <> help desc <> metavar "INT"
@@ -98,10 +107,12 @@ main :: IO ()
 main = do
   cmd <- execParser cmdargs
   case cmd of
-    Build     -> buildMusicDb
-    Count{..} -> countPlays cmdArtist
-    Best{..}  -> recommendBest cmdArtist
-                   cmdLikedSongPlays cmdLikedSongsMin cmdTopSongs
+    Build       -> buildMusicDb
+    Count{..}   -> countPlays cmdArtist
+    Best{..}    -> recommendBest cmdArtist
+                     cmdLikedSongPlays cmdLikedSongsMin cmdTopSongs
+    Diverse{..} -> recommendDiverse cmdArtist
+                     cmdLikedSongPlays cmdLikedSongsMin
 
 {-
 The Echo Nest / MSD music dataset:
@@ -352,15 +363,14 @@ getSongTitle db song =
     (Only song)
 
 findFavorites :: SQL.Connection -> ArtistId -> UserId -> Int -> IO [SongId]
-findFavorites db artist user limit =
+findFavorites db artist user minPlays =
   map fromOnly <$> SQL.query db
     "SELECT listens.song \
     \FROM listens \
     \INNER JOIN songs ON listens.song = songs.id \
-    \WHERE listens.user=? AND songs.artist=? \
-    \ORDER BY listens.plays DESC \
-    \LIMIT ?"
-    (user, artist, limit)
+    \WHERE listens.user=? AND songs.artist=? AND listens.plays >= ? \
+    \ORDER BY listens.plays DESC"
+    (user, artist, minPlays)
 
 recommendBest :: Artist -> Int -> Int -> Int -> IO ()
 recommendBest artistName likedSongPlays likedSongsMin topSongs =
@@ -371,16 +381,44 @@ recommendBest artistName likedSongPlays likedSongsMin topSongs =
   artistFans <- findFans db artist likedSongPlays likedSongsMin
   -- For each fan, find nir top Z favorite songs.
   favoriteLists <- for artistFans $ \fan ->
-    findFavorites db artist fan topSongs
+    take topSongs <$> findFavorites db artist fan likedSongPlays
   -- Also find all songs of the artist.
   songs <- findSongs db artist
   -- For each song, say how many people like it.
   let countFans song = length (filter (song `elem`) favoriteLists)
-      songs' = reverse . sortWith snd $
+      songs' = reverse . sortOn snd $
         [(song, fans) | song <- songs, let fans = countFans song, fans /= 0]
   for_ songs' $ \(song, fans) -> do
     title <- T.unpack <$> getSongTitle db song
     printf "%4d – %s\n" fans title
+
+recommendDiverse :: Artist -> Int -> Int -> IO ()
+recommendDiverse artistName likedSongPlays likedSongsMin  =
+  withMusicDb $ \db -> do
+  artist <- getArtistId db artistName
+  -- Find fans and their favorite songs.
+  allFans <- do
+    fs <- findFans db artist likedSongPlays likedSongsMin
+    for fs $ \fan ->
+      (fan, ) <$> findFavorites db artist fan likedSongPlays
+  -- Find all songs of the artist.
+  allSongs <- findSongs db artist
+  -- Now find a set of songs which pleases everyone by finding the song which
+  -- pleases the most number of people, outputting it, and removing everyone
+  -- who likes it from the list of people.
+  let go [] _ = return ()
+      go _ [] = return ()
+      go songs fans = do
+        let songFans :: SongId -> [UserId]
+            songFans song = [fan | (fan, favs) <- fans, song `elem` favs]
+        let songs' = map (id &&& songFans) songs
+        let (bestSong, bestSongFans):rest = sortOn (Down . length . snd) songs'
+        unless (null bestSongFans) $ do
+          title <- T.unpack <$> getSongTitle db bestSong
+          printf "%4d – %s\n" (length bestSongFans) title
+          let fans' = filter (\(fan,_) -> fan `notElem` bestSongFans) fans
+          go (map fst rest) fans'
+  go allSongs allFans
 
 -- Utils
 
