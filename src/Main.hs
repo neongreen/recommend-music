@@ -379,7 +379,7 @@ recommendBest artistName likedSongPlays likedSongsMin topSongs =
   -- Find fans (i.e. people who like X or more songs, where “like” means
   -- “listened Y times or more”).
   artistFans <- findFans db artist likedSongPlays likedSongsMin
-  -- For each fan, find nir top Z favorite songs.
+  -- For each fan, find their top Z favorite songs.
   favoriteLists <- for artistFans $ \fan ->
     take topSongs <$> findFavorites db artist fan likedSongPlays
   -- Also find all songs of the artist.
